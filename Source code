@@ -1,0 +1,268 @@
+/*
+ * ====================================================================
+ * Built A Smart Traffic Management System Using Iot
+ * ====================================================================
+ * 
+ * Author: Vedhathiri.K /CircuitDigest
+ * Date: November 2025
+*/
+// Smart Traffic Management - ESP32 (Final Fixed Version)
+// Normal cycle: 5s GREEN, 5s YELLOW for each lane
+// When a lane is RED, IR counts vehicles. If count >= 2 → that lane gets GREEN immediately.
+// After preemption, count resets to 0 and normal cycle resumes.
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ====== WiFi Credentials ======
+const char* WIFI_SSID     = "your wifi name";
+const char* WIFI_PASSWORD = "your wifi password";
+
+// ====== Timing Config ======
+const unsigned long GREEN_DURATION_MS  = 5000;  // 5 sec
+const unsigned long YELLOW_DURATION_MS = 5000;   // 5 sec
+const unsigned long ALL_RED_DELAY_MS   = 2000;   // 2 sec safety delay before preemption
+const unsigned long DEBOUNCE_MS        = 80;     // IR debounce
+
+// ====== Lane Config ======
+const uint8_t NUM_LANES = 4;
+
+// LED Pins
+const uint8_t greenLedPins[NUM_LANES]  = {16, 17, 18, 19};
+const uint8_t yellowLedPins[NUM_LANES] = {21, 22, 23, 25};
+const uint8_t redLedPins[NUM_LANES]    = {32, 33, 27, 26};
+
+// IR Pins
+const uint8_t irPins[NUM_LANES] = {13, 12, 14, 15};
+
+// ====== Web Server ======
+WebServer server(80);
+
+// ====== State Machine ======
+enum SignalState { RED, YELLOW, GREEN };
+SignalState laneState[NUM_LANES];
+uint8_t currentGreenIndex = 0;
+unsigned long stateStartMillis = 0;
+unsigned long stateDurationMs = GREEN_DURATION_MS;
+
+// ====== IR Counting ======
+unsigned int vehicleCount[NUM_LANES] = {0, 0, 0, 0};
+int lastIrState[NUM_LANES] = {HIGH, HIGH, HIGH, HIGH};
+bool irTriggered[NUM_LANES] = {false, false, false, false};
+unsigned long lastIrChangeMillis[NUM_LANES] = {0, 0, 0, 0};
+
+// ====== Preemption ======
+bool inPreemption = false;
+bool preemptionReady = false;
+uint8_t preemptedLane = 0;
+
+// ====== Serial Print Control ======
+unsigned long lastSerialPrint = 0;
+const unsigned long SERIAL_INTERVAL = 1000;
+
+// ====================================================
+// Helper Functions
+// ====================================================
+
+void setLaneState(uint8_t lane, SignalState s) {
+  laneState[lane] = s;
+  digitalWrite(greenLedPins[lane],  (s == GREEN));
+  digitalWrite(yellowLedPins[lane], (s == YELLOW));
+  digitalWrite(redLedPins[lane],    (s == RED));
+}
+
+void allRed() {
+  for (uint8_t i = 0; i < NUM_LANES; i++) setLaneState(i, RED);
+}
+
+void setupPins() {
+  for (uint8_t i = 0; i < NUM_LANES; i++) {
+    pinMode(greenLedPins[i], OUTPUT);
+    pinMode(yellowLedPins[i], OUTPUT);
+    pinMode(redLedPins[i], OUTPUT);
+    pinMode(irPins[i], INPUT_PULLUP);
+  }
+  allRed();
+}
+
+void startNormalCycle(uint8_t lane = 0) {
+  currentGreenIndex = lane;
+  for (uint8_t i = 0; i < NUM_LANES; i++)
+    setLaneState(i, (i == lane) ? GREEN : RED);
+
+  // Reset count when the lane turns GREEN
+  vehicleCount[lane] = 0;
+  Serial.printf("[RESET] Lane %d count reset to 0 (start of GREEN)\n", lane + 1);
+
+  stateStartMillis = millis();
+  stateDurationMs = GREEN_DURATION_MS;
+  inPreemption = false;
+  preemptionReady = false;
+  Serial.printf("[CYCLE] Normal cycle started, Lane %d GREEN\n", lane + 1);
+}
+
+// ====================================================
+// IR Sensor Vehicle Counting
+// ====================================================
+void checkIR() {
+  unsigned long now = millis();
+
+  for (uint8_t i = 0; i < NUM_LANES; i++) {
+    if (laneState[i] != RED) continue;  // Count only if RED
+
+    int reading = digitalRead(irPins[i]);
+    if (reading != lastIrState[i]) {
+      lastIrChangeMillis[i] = now;
+      lastIrState[i] = reading;
+    }
+
+    if ((now - lastIrChangeMillis[i]) > DEBOUNCE_MS) {
+      if (reading == LOW && !irTriggered[i]) {
+        irTriggered[i] = true;
+        vehicleCount[i]++;
+        Serial.printf("[COUNT] Lane %d: Vehicle detected → %d\n", i + 1, vehicleCount[i]);
+      } else if (reading == HIGH && irTriggered[i]) {
+        irTriggered[i] = false;
+      }
+    }
+  }
+}
+
+// ====================================================
+// Preemption Handling
+// ====================================================
+void checkPreemption() {
+  if (inPreemption || preemptionReady) return;
+
+  for (uint8_t i = 0; i < NUM_LANES; i++) {
+    if (laneState[i] == RED && vehicleCount[i] >= 2) {
+      Serial.printf("[PREEMPT] Lane %d reached 2 vehicles. Preparing preemption.\n", i + 1);
+      allRed();
+      inPreemption = true;
+      preemptedLane = i;
+      stateStartMillis = millis();
+      stateDurationMs = ALL_RED_DELAY_MS;
+      preemptionReady = true;
+      break;
+    }
+  }
+}
+
+void handlePreemption() {
+  unsigned long now = millis();
+
+  if (inPreemption && preemptionReady && (now - stateStartMillis >= stateDurationMs)) {
+    Serial.printf("[PREEMPT] Activating preemption: Lane %d GREEN\n", preemptedLane + 1);
+
+    for (uint8_t i = 0; i < NUM_LANES; i++)
+      setLaneState(i, (i == preemptedLane) ? GREEN : RED);
+
+    // Reset count for preempted lane
+    vehicleCount[preemptedLane] = 0;
+    Serial.printf("[RESET] Lane %d count reset to 0 (preemption)\n", preemptedLane + 1);
+
+    currentGreenIndex = preemptedLane;
+    stateStartMillis = now;
+    stateDurationMs = GREEN_DURATION_MS;
+    inPreemption = false;
+    preemptionReady = false;
+  }
+}
+
+// ====================================================
+// Normal Signal State Transitions
+// ====================================================
+void handleNormalCycle() {
+  unsigned long now = millis();
+  if (inPreemption || preemptionReady) return;
+  if (now - stateStartMillis < stateDurationMs) return;
+
+  if (laneState[currentGreenIndex] == GREEN) {
+    setLaneState(currentGreenIndex, YELLOW);
+    stateStartMillis = now;
+    stateDurationMs = YELLOW_DURATION_MS;
+    Serial.printf("[CYCLE] Lane %d GREEN → YELLOW\n", currentGreenIndex + 1);
+  }
+  else if (laneState[currentGreenIndex] == YELLOW) {
+    setLaneState(currentGreenIndex, RED);
+    currentGreenIndex = (currentGreenIndex + 1) % NUM_LANES;
+    setLaneState(currentGreenIndex, GREEN);
+
+    // Reset count when lane turns GREEN
+    vehicleCount[currentGreenIndex] = 0;
+    Serial.printf("[RESET] Lane %d count reset to 0 (auto cycle)\n", currentGreenIndex + 1);
+
+    stateStartMillis = now;
+    stateDurationMs = GREEN_DURATION_MS;
+    Serial.printf("[CYCLE] Next: Lane %d GREEN\n", currentGreenIndex + 1);
+  }
+}
+
+// ====================================================
+// Web Dashboard
+// ====================================================
+String getDashboardHTML() {
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Traffic Dashboard</title>"
+                "<meta http-equiv='refresh' content='1'>"
+                "<style>body{font-family:Arial;text-align:center;background:#f5f5f5;}"
+                ".lane{padding:15px;margin:10px;border-radius:10px;display:inline-block;width:180px;}"
+                ".red{background:#ffcccc;} .yellow{background:#fff9c4;} .green{background:#c8e6c9;}</style>"
+                "</head><body><h1>Smart Traffic System</h1>";
+
+  for (uint8_t i = 0; i < NUM_LANES; i++) {
+    String color = (laneState[i] == RED) ? "red" : (laneState[i] == YELLOW) ? "yellow" : "green";
+    html += "<div class='lane " + color + "'><h3>Lane " + String(i + 1) + "</h3>";
+    html += "State: " + String((laneState[i] == RED) ? "RED" : (laneState[i] == YELLOW) ? "YELLOW" : "GREEN");
+    html += "<br>Count: " + String(vehicleCount[i]) + "</div>";
+  }
+
+  html += "<p>Count only during RED. Auto green if count ≥ 2.</p></body></html>";
+  return html;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", getDashboardHTML());
+}
+
+// ====================================================
+// Setup & Loop
+// ====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== SMART TRAFFIC MANAGEMENT SYSTEM ===");
+
+  setupPins();
+  startNormalCycle();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  checkIR();
+  checkPreemption();
+  handlePreemption();
+  handleNormalCycle();
+
+  unsigned long now = millis();
+  if (now - lastSerialPrint > SERIAL_INTERVAL) {
+    lastSerialPrint = now;
+    Serial.printf("[STATUS] Lane %d GREEN | Counts: ", currentGreenIndex + 1);
+    for (int i = 0; i < NUM_LANES; i++) {
+      Serial.printf("L%d:%d ", i + 1, vehicleCount[i]);
+    }
+    Serial.println();
+  }
+  delay(10);
+}
