@@ -120,6 +120,8 @@ The dashboard auto-refreshes every second and shows:
 - Replace IR sensors with **ESP32-CAM** for visual traffic detection  
 
 ---
+Project link:
+https://circuitdigest.com/microcontroller-projects/smart-traffic-management-system-using-iot
 
 
 ## 👨‍💻 Author
